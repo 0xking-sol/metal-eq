@@ -19,6 +19,18 @@ for reference, silentarmy through Apple's OpenCL did ~136 Sol/s on the same M5 P
 
 every solution gets checked again inside zebrad (Equihash validity, then the real block hash against the target) before it can become a block. no invalid solutions so far.
 
+## safety
+
+- source only. no prebuilt binaries and nothing gets downloaded at build or run time. you build it yourself with Apple's compiler (`build.sh` is 3 commands), so you can read it all first
+- no network access. metal-eq reads jobs on stdin and writes solutions on stdout, and the binary only links Apple's system frameworks (check with `otool -L metal-eq` and `nm -u metal-eq`)
+- it never sees your wallet, keys or RPC. all zebrad hands it is the block header to mine (public data), and all it sends back is a nonce and a solution. it reads no files or env vars, and the only file it writes is the one you name with `--verify-out`
+- zebrad re-checks every solution before it can become a block, so even a broken solver cant get you a bad block. worst case is wasted GPU time
+- no sudo, no installer, no launch agents. it runs as your user
+- the zebrad patch only touches the miner (3 files, readable diff in `zebrad/`), no consensus, wallet or networking code. GPU mining stays off unless you set `SILENTARMY_SOLVERS`
+- no dev fee and no telemetry
+- hardware wise its an ordinary Metal compute job like a game or a local AI model: no overclocking, drivers or kernel extensions, and macOS throttles it if things get hot. laptops get warm and loud, see tips
+- check its output yourself: `./metal-eq --nonces 50 --verify-out f.txt && python3 tools/eqcheck.py f.txt` (independent checker, only python's standard library)
+
 ## settings per machine
 
 the best flags depend on the chip. quickest way to find yours: plug in and run `./tune.sh` (a minute or two). it benchmarks the main combinations back to back, re-checks the top 3 and prints the winner plus a wrapper line to mine with it. if a metal-eq is already mining it gets paused during the tune and resumed after.
