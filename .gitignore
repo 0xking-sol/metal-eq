@@ -1,0 +1,5 @@
+metal-eq
+*.o
+.DS_Store
+kernel_src.h
+kernel_v2_src.h

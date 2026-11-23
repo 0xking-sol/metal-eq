@@ -1,0 +1,64 @@
+MIT License
+
+Copyright (c) 2026 the metal-eq authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------------
+
+Parts of metal-eq come from SILENTARMY (https://github.com/mbevand/silentarmy):
+blake.c, blake.h, sha256.c and sha256.h are copied unchanged, equihash.metal is
+a port of its OpenCL kernels (input.cl), metal_eq.m keeps its host helpers and
+mining protocol (main.c), and the round-0 BLAKE2b code in equihash_v2.metal
+follows input.cl. These parts are under SILENTARMY's license:
+
+The MIT License (MIT)
+
+Copyright (c) 2016 Marc Bevand
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------------
+
+sha256.c/sha256.h started as Igor Pavlov's public domain Sha256.c (LZMA SDK),
+based on public domain code from Wei Dai's Crypto++. Marc Bevand's changes to
+it are under SILENTARMY's license above.
+
+The file in zebrad/ is a patch to Zcash Crosslink
+(https://github.com/ShieldedLabs/crosslink_monolith), not part of metal-eq.
+zebrad/zebrad-gpu-solvers-v18.patch changes zebrad (zebra-crosslink, licensed
+MIT OR Apache-2.0). The changes it makes are offered under the MIT license
+above or the Apache License, Version 2.0, at your option. The upstream code it
+shows (diff context) belongs to its authors and stays under upstream's terms.

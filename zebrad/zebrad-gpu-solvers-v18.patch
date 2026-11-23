@@ -1,0 +1,513 @@
+diff --git a/zebra-crosslink/zebrad/src/components.rs b/zebra-crosslink/zebrad/src/components.rs
+index 30f4422..0adfaad 100644
+--- a/zebra-crosslink/zebrad/src/components.rs
++++ b/zebra-crosslink/zebrad/src/components.rs
+@@ -22,6 +22,10 @@ pub mod zcashd_compat;
+ #[cfg(feature = "internal-miner")]
+ pub mod miner;
+ 
++// Apple-GPU solvers for the internal miner (see miner_gpu.rs).
++#[cfg(feature = "internal-miner")]
++pub mod miner_gpu;
++
+ pub use inbound::Inbound;
+ pub use sync::ChainSync;
+ 
+diff --git a/zebra-crosslink/zebrad/src/components/miner.rs b/zebra-crosslink/zebrad/src/components/miner.rs
+index 8f1387e..5048c17 100644
+--- a/zebra-crosslink/zebrad/src/components/miner.rs
++++ b/zebra-crosslink/zebrad/src/components/miner.rs
+@@ -42,6 +42,9 @@ use zebra_state::WatchReceiver;
+ 
+ use zebra_rpc::config::mining::Config as MiningConfig;
+ 
++// Apple-GPU solvers.
++use crate::components::miner_gpu;
++
+ // Every duration below is measured in *chain* time, not wall-clock time: they exist
+ // because a tip only changes so often and a template is only worth rebuilding so often.
+ // So they are waited on with the `zebra_debug_time` timers, which tick in chain time, and
+@@ -222,7 +225,14 @@ where
+     // tip changes, or the extra threads mine a chain that is already dead. They are —
+     // `cancel_fn` below fires on every template change, and a new tip always changes the
+     // template — so this is the operator's choice to make.
+-    let configured_threads = mining_config.internal_miner_threads.max(1);
++    // With GPU solvers, 0 CPU solvers is allowed. While the
++    // GPU mines, macOS holds the CPU to ~5 W, and a CPU solver (~1 Sol/s) takes power that the GPU
++    // solver's own CPU helpers (metal-eq --cpu-sg) turn into far more.
++    let configured_threads = if miner_gpu::gpu_solver_count() > 0 {
++        mining_config.internal_miner_threads
++    } else {
++        mining_config.internal_miner_threads.max(1)
++    };
+     // If we can't detect the number of cores, use the configured number.
+     let available_threads = available_parallelism()
+         .map(usize::from)
+@@ -281,6 +291,40 @@ where
+         mining_solvers.push(solver.wait_for_panics());
+     }
+ 
++    // Add the Apple-GPU solvers, see `miner_gpu`.
++    // Their ids start at GPU_SOLVER_ID_BASE, so they need the CPU ids to stay below it.
++    let gpu_solver_count = miner_gpu::gpu_solver_count();
++    if gpu_solver_count > 0 && !skip_pow {
++        if solver_count > usize::from(miner_gpu::GPU_SOLVER_ID_BASE) {
++            warn!(
++                ?solver_count,
++                ?gpu_solver_count,
++                "too many CPU solvers to add GPU solvers: GPU mining is off"
++            );
++        } else {
++            info!(?gpu_solver_count, "launching GPU mining solvers");
++
++            for gpu_index in 0..gpu_solver_count {
++                let solver_id = miner_gpu::GPU_SOLVER_ID_BASE
++                    + u8::try_from(gpu_index).expect("gpu_solver_count() is at most 64");
++
++                let solver = tokio::task::spawn(
++                    run_mining_solver(
++                        solver_id,
++                        low_priority,
++                        skip_pow,
++                        template_receiver.clone(),
++                        rpc.clone(),
++                    )
++                    .in_current_span(),
++                );
++                abort_handles.push(solver.abort_handle());
++
++                mining_solvers.push(solver.wait_for_panics());
++            }
++        }
++    }
++
+     // These tasks run forever unless there is a fatal error or shutdown.
+     // When that happens, the first task to error returns, and the other JoinHandle futures are
+     // cancelled.
+@@ -581,6 +625,12 @@ where
+         let template = template_receiver.cloned_watch_data();
+ 
+         let Some(template) = template else {
++            // No template means mining is off (or hasn't started yet), so don't leave a GPU
++            // solver grinding the last job.
++            if miner_gpu::is_gpu_solver(solver_id) {
++                miner_gpu::stop(solver_id);
++            }
++
+             if solver_id == 0 {
+                 info!(
+                     ?solver_id,
+@@ -657,10 +707,11 @@ where
+                 );
+             }
+ 
+-            // If the blockchain is changing rapidly, limit how often we'll update the template.
+-            // But if we're shutting down, do that immediately.
++            // A cancelled solver already has a fresh template
++            // waiting (that is why it was cancelled), and the template generator itself is still
++            // rate-limited by BLOCK_TEMPLATE_REFRESH_LIMIT. So pause only briefly instead of 2 s.
+             if template_receiver.has_changed().is_ok() && !is_shutting_down() {
+-                zebra_debug_time::sleep(BLOCK_TEMPLATE_REFRESH_LIMIT).await;
++                zebra_debug_time::sleep(std::time::Duration::from_millis(50)).await;
+             }
+ 
+             continue;
+@@ -823,7 +874,12 @@ where
+                     info!(?error, "could not set the miner thread priority: running at default priority");
+                 }
+ 
+-                Solution::solve(header, omits_fat_pointer, cancel_fn)
++                // GPU solver ids mine on the Apple GPU.
++                if miner_gpu::is_gpu_solver(solver_id) {
++                    miner_gpu::solve(solver_id, header, omits_fat_pointer, cancel_fn)
++                } else {
++                    Solution::solve(header, omits_fat_pointer, cancel_fn)
++                }
+             }).expect("unable to spawn miner thread");
+ 
+             miner_thread_handle.wait_for_panics()
+diff --git a/zebra-crosslink/zebrad/src/components/miner_gpu.rs b/zebra-crosslink/zebrad/src/components/miner_gpu.rs
+new file mode 100644
+index 0000000..6fa6a4d
+--- /dev/null
++++ b/zebra-crosslink/zebrad/src/components/miner_gpu.rs
+@@ -0,0 +1,379 @@
++//! Apple-GPU Equihash solvers for the internal miner.
++//!
++//! The GPU solver is metal-eq (or silentarmy), run as long-lived `--mining` child
++//! processes, one per GPU solver id. A job goes in on the child's stdin, and solutions come
++//! back on its stdout, using silentarmy's own mining protocol.
++//!
++//! silentarmy checks solutions against a target using a plain Zcash header hash, but a
++//! Crosslink block hash also covers the BFT fat pointer. So the child gets a target that
++//! every hash meets (it returns every Equihash solution it finds), and this module checks
++//! each one against the real header, like [`Solution::solve()`] does: Equihash validity
++//! first, then the block hash (from FeaturenetUpgrade2: the hash without the fat pointer, as
++//! `omits_fat_pointer` says) against the difficulty threshold. So a bad, stale or garbled
++//! GPU result can never become a block.
++//!
++//! Configuration, from the environment. (Not `ZEBRA_*` names: Zebra reads every one of those
++//! as a config field, and refuses to start on unknown ones.)
++//! - `SILENTARMY_SOLVERS`: how many GPU solvers to run (default 0: GPU mining is off).
++//! - `SILENTARMY_BIN`: the solver binary (default [`DEFAULT_SOLVER_BIN`], looked up on `PATH`).
++//!
++//! GPU solver ids start at [`GPU_SOLVER_ID_BASE`]. The first nonce byte of a block is its
++//! solver id, so the nonce shows whether the CPU or the GPU found it.
++
++use std::{
++    collections::HashMap,
++    io::{BufRead, BufReader, Write},
++    process::{Child, Command, Stdio},
++    sync::{
++        atomic::{AtomicU64, Ordering},
++        mpsc::{self, RecvTimeoutError, TrySendError},
++        Arc, Mutex, OnceLock, PoisonError,
++    },
++    thread,
++    time::{Duration, Instant},
++};
++
++use zebra_chain::{
++    block::Header,
++    serialization::{AtLeastOne, ZcashSerialize},
++    shutdown::is_shutting_down,
++    work::equihash::{Solution, SolverCancelled},
++};
++
++/// The first GPU solver id. CPU solver ids count up from zero.
++pub const GPU_SOLVER_ID_BASE: u8 = 128;
++
++/// The most GPU solvers we will run.
++const MAX_GPU_SOLVERS: usize = 64;
++
++/// The default solver binary, looked up on `PATH` (set `SILENTARMY_BIN` to use another).
++pub const DEFAULT_SOLVER_BIN: &str = "metal-eq";
++
++/// How often a waiting solver checks whether it has been cancelled.
++const POLL_INTERVAL: Duration = Duration::from_millis(100);
++
++/// The minimum time between starts of one GPU solver process.
++const RESTART_DELAY: Duration = Duration::from_secs(30);
++
++/// How often to log GPU solver statistics.
++const STATS_INTERVAL: Duration = Duration::from_secs(600);
++
++/// How many unread output lines to keep per GPU solver. Later lines are dropped: nobody is
++/// waiting for them, so they are for an old template anyway.
++const MAX_QUEUED_LINES: usize = 256;
++
++/// Every hash meets this target, so silentarmy returns every solution it finds.
++const ACCEPT_ALL_TARGET: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
++const _: () = assert!(ACCEPT_ALL_TARGET.len() == 64, "a target is 32 bytes of hex");
++
++/// The compact size that silentarmy puts before a 1344-byte solution.
++const SOLUTION_SIZE_PREFIX: &str = "fd4005";
++
++/// Solutions for the current template that passed the Equihash check.
++static SOLUTIONS_CHECKED: AtomicU64 = AtomicU64::new(0);
++/// Solutions that failed to decode or failed the Equihash check.
++static SOLUTIONS_INVALID: AtomicU64 = AtomicU64::new(0);
++/// Solutions for an older template.
++static SOLUTIONS_STALE: AtomicU64 = AtomicU64::new(0);
++/// Solutions that met the difficulty threshold.
++static BLOCKS_FOUND: AtomicU64 = AtomicU64::new(0);
++/// When statistics were last logged, and the checked count at that time.
++static LAST_STATS: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
++
++/// The state of each GPU solver id, kept across templates.
++static SLOTS: OnceLock<Mutex<HashMap<u8, Arc<Mutex<Slot>>>>> = OnceLock::new();
++
++/// Returns the number of GPU solvers to run, from `SILENTARMY_SOLVERS`.
++pub fn gpu_solver_count() -> usize {
++    std::env::var("SILENTARMY_SOLVERS")
++        .ok()
++        .and_then(|count| count.trim().parse().ok())
++        .unwrap_or(0)
++        .min(MAX_GPU_SOLVERS)
++}
++
++/// Returns `true` if `solver_id` belongs to a GPU solver.
++pub fn is_gpu_solver(solver_id: u8) -> bool {
++    solver_id >= GPU_SOLVER_ID_BASE
++}
++
++/// Returns the path of the silentarmy solver binary.
++fn solver_bin() -> String {
++    std::env::var("SILENTARMY_BIN").unwrap_or_else(|_| DEFAULT_SOLVER_BIN.to_string())
++}
++
++/// One running solver process.
++struct Worker {
++    child: Child,
++    /// Jobs for the child. The writer thread only ever passes on the newest job.
++    jobs: mpsc::Sender<String>,
++    /// Lines the child printed on stdout.
++    lines: mpsc::Receiver<String>,
++}
++
++impl Drop for Worker {
++    fn drop(&mut self) {
++        let _ = self.child.kill();
++        let _ = self.child.wait();
++    }
++}
++
++/// The state of one GPU solver id.
++#[derive(Default)]
++struct Slot {
++    worker: Option<Worker>,
++    last_start: Option<Instant>,
++    jobs_sent: u64,
++}
++
++/// Returns the state of GPU solver `solver_id`.
++fn solver_slot(solver_id: u8) -> Arc<Mutex<Slot>> {
++    SLOTS
++        .get_or_init(Default::default)
++        .lock()
++        .unwrap_or_else(PoisonError::into_inner)
++        .entry(solver_id)
++        .or_default()
++        .clone()
++}
++
++/// Starts a solver process for `solver_id`, with threads that feed it jobs and
++/// collect its output.
++fn start_worker(solver_id: u8) -> std::io::Result<Worker> {
++    let mut child = Command::new(solver_bin())
++        .arg("--mining")
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped())
++        .spawn()?;
++    let mut stdin = child.stdin.take().expect("stdin is piped");
++    let stdout = child.stdout.take().expect("stdout is piped");
++    let stderr = child.stderr.take().expect("stderr is piped");
++
++    let (job_sender, job_receiver) = mpsc::channel::<String>();
++    let (line_sender, line_receiver) = mpsc::sync_channel::<String>(MAX_QUEUED_LINES);
++
++    // From here on, dropping `worker` (including on an early return) kills the child.
++    let worker = Worker {
++        child,
++        jobs: job_sender,
++        lines: line_receiver,
++    };
++
++    thread::Builder::new()
++        .name(format!("gpu-solver-{solver_id}-in"))
++        .spawn(move || {
++            while let Ok(mut job) = job_receiver.recv() {
++                // Jobs can queue up while the child is paused: only the newest one matters.
++                while let Ok(newer_job) = job_receiver.try_recv() {
++                    job = newer_job;
++                }
++                if stdin
++                    .write_all(job.as_bytes())
++                    .and_then(|()| stdin.flush())
++                    .is_err()
++                {
++                    break;
++                }
++            }
++        })?;
++
++    thread::Builder::new()
++        .name(format!("gpu-solver-{solver_id}-out"))
++        .spawn(move || {
++            for line in BufReader::new(stdout).lines() {
++                let Ok(line) = line else { break };
++                match line_sender.try_send(line) {
++                    Ok(()) | Err(TrySendError::Full(_)) => {}
++                    Err(TrySendError::Disconnected(_)) => break,
++                }
++            }
++        })?;
++
++    thread::Builder::new()
++        .name(format!("gpu-solver-{solver_id}-err"))
++        .spawn(move || {
++            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
++                info!(solver_id, "GPU solver says: {line}");
++            }
++        })?;
++
++    Ok(worker)
++}
++
++/// Decodes the nonce and solution from the fields of a silentarmy solution line.
++fn decode_solution(
++    solver_id: u8,
++    nonce_rightpart: &str,
++    solution: &str,
++) -> Option<([u8; 32], Solution)> {
++    let nonce_rightpart = hex::decode(nonce_rightpart).ok()?;
++    let mut nonce = [0; 32];
++    if nonce_rightpart.len() != nonce.len() - 1 {
++        return None;
++    }
++    // The job fixed the first nonce byte to the solver id, and silentarmy chose the rest.
++    nonce[0] = solver_id;
++    nonce[1..].copy_from_slice(&nonce_rightpart);
++
++    let solution = hex::decode(solution.strip_prefix(SOLUTION_SIZE_PREFIX)?).ok()?;
++    Some((nonce, Solution::from_bytes(&solution).ok()?))
++}
++
++/// Logs GPU solver statistics, at most once every [`STATS_INTERVAL`].
++fn maybe_log_stats() {
++    let mut last_stats = LAST_STATS.lock().unwrap_or_else(PoisonError::into_inner);
++    let checked = SOLUTIONS_CHECKED.load(Ordering::Relaxed);
++
++    match *last_stats {
++        None => *last_stats = Some((Instant::now(), checked)),
++        Some((since, checked_then)) if since.elapsed() >= STATS_INTERVAL => {
++            let rate = checked.saturating_sub(checked_then) as f64 / since.elapsed().as_secs_f64();
++            info!(
++                solutions_per_second = %format!("{rate:.1}"),
++                checked,
++                invalid = SOLUTIONS_INVALID.load(Ordering::Relaxed),
++                stale = SOLUTIONS_STALE.load(Ordering::Relaxed),
++                blocks_found = BLOCKS_FOUND.load(Ordering::Relaxed),
++                "GPU solvers: Equihash solution rate since the last report",
++            );
++            *last_stats = Some((Instant::now(), checked));
++        }
++        Some(_) => {}
++    }
++}
++
++/// Stops GPU solver `solver_id`'s process, if it is running: dropping the worker kills and
++/// reaps the child (SIGKILL also ends one paused with SIGSTOP). The next [`solve()`] starts a
++/// new one right away.
++pub fn stop(solver_id: u8) {
++    let slot = solver_slot(solver_id);
++    let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
++    if slot.worker.take().is_some() {
++        slot.last_start = None;
++        info!(solver_id, "stopped GPU solver: no template to mine");
++    }
++}
++
++/// Mines `header` on GPU solver `solver_id`, like [`Solution::solve()`] does on the CPU.
++///
++/// Returns as soon as a solution meets the difficulty threshold. Returns
++/// `Err(SolverCancelled)` if `cancel_fn()` returns an error, or Zebra is shutting down.
++pub fn solve<F>(
++    solver_id: u8,
++    mut header: Header,
++    omits_fat_pointer: bool,
++    mut cancel_fn: F,
++) -> Result<AtLeastOne<Header>, SolverCancelled>
++where
++    F: FnMut() -> Result<(), SolverCancelled>,
++{
++    let mut input = Vec::new();
++    header
++        .zcash_serialize(&mut input)
++        .expect("serialization into a vec can't fail");
++    // The part of the header before the nonce and solution is the Equihash input.
++    let input = hex::encode(&input[0..Solution::INPUT_LENGTH]);
++
++    let difficulty_threshold = header
++        .difficulty_threshold
++        .to_expanded()
++        .expect("unexpected invalid header template: invalid difficulty threshold");
++
++    let slot = solver_slot(solver_id);
++    let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
++    slot.jobs_sent += 1;
++    let job_id = format!("s{solver_id}j{}", slot.jobs_sent);
++    // "<target> <job id> <header before the nonce> <first nonce byte>"
++    let job = format!("{ACCEPT_ALL_TARGET} {job_id} {input} {solver_id:02x}\n");
++    let mut job_sent = false;
++
++    loop {
++        if is_shutting_down() {
++            // Kill the child now: one paused with SIGSTOP would never see the EOF on its stdin.
++            slot.worker = None;
++            return Err(SolverCancelled);
++        }
++        cancel_fn()?;
++        maybe_log_stats();
++
++        if slot.worker.is_none() {
++            if slot
++                .last_start
++                .is_some_and(|started| started.elapsed() < RESTART_DELAY)
++            {
++                thread::sleep(POLL_INTERVAL);
++                continue;
++            }
++
++            slot.last_start = Some(Instant::now());
++            match start_worker(solver_id) {
++                Ok(worker) => {
++                    info!(solver_id, "started GPU solver");
++                    slot.worker = Some(worker);
++                    job_sent = false;
++                }
++                Err(error) => {
++                    warn!(?error, solver_id, bin = %solver_bin(), "could not start GPU solver, will retry");
++                    continue;
++                }
++            }
++        }
++
++        let worker = slot.worker.as_mut().expect("just checked or started");
++        if !job_sent {
++            job_sent = worker.jobs.send(job.clone()).is_ok();
++        }
++
++        let line = match worker.lines.recv_timeout(POLL_INTERVAL) {
++            Ok(line) => line,
++            Err(RecvTimeoutError::Timeout) => continue,
++            Err(RecvTimeoutError::Disconnected) => {
++                warn!(solver_id, "GPU solver exited, restarting it");
++                slot.worker = None;
++                continue;
++            }
++        };
++
++        // "sol: <job id> <time> <rest of the nonce> fd4005<solution>"
++        // The startup banner and the periodic "status:" lines are ignored.
++        let Some(fields) = line.strip_prefix("sol: ") else {
++            continue;
++        };
++        let fields: Vec<&str> = fields.split_ascii_whitespace().collect();
++        let &[line_job_id, _time, nonce_rightpart, solution] = fields.as_slice() else {
++            SOLUTIONS_INVALID.fetch_add(1, Ordering::Relaxed);
++            continue;
++        };
++        if line_job_id != job_id {
++            SOLUTIONS_STALE.fetch_add(1, Ordering::Relaxed);
++            continue;
++        }
++        let Some((nonce, solution)) = decode_solution(solver_id, nonce_rightpart, solution) else {
++            SOLUTIONS_INVALID.fetch_add(1, Ordering::Relaxed);
++            continue;
++        };
++
++        *header.nonce = nonce;
++        header.solution = solution;
++        if let Err(error) = header.solution.check(&header) {
++            SOLUTIONS_INVALID.fetch_add(1, Ordering::Relaxed);
++            debug!(?error, solver_id, "GPU solver returned an invalid solution");
++            continue;
++        }
++        SOLUTIONS_CHECKED.fetch_add(1, Ordering::Relaxed);
++
++        // This is a u256 integer comparison, like zcashd and bitcoin. Greater values
++        // represent less work.
++        // From FeaturenetUpgrade2 the filter compares the hash without the fat pointer, like
++        // `Solution::difficulty_is_valid` (upstream v17).
++        let hash = if omits_fat_pointer { header.hash_without_fat_pointer() } else { header.hash() };
++        if hash <= difficulty_threshold {
++            BLOCKS_FOUND.fetch_add(1, Ordering::Relaxed);
++            info!(solver_id, ?hash, "GPU solver found a block");
++            return Ok(vec![header]
++                .try_into()
++                .expect("a one-element vec is an AtLeastOne"));
++        }
++    }
++}
